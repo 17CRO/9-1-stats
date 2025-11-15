@@ -475,7 +475,56 @@
         let dbReady = false;
         let allVentesData = []; // Cache local pour toutes les ventes
         let allArticlesData = new Map(); // Cache local pour les articles (Map pour VLOOKUP rapide)
-        let chartInstances = {}; // Pour stocker les instances de graphiques
+ 
+        // --- Helpers de parsing pour les ventes (dates / prix) ---
+        function parseVenteDate(rawDate) {
+            if (!rawDate) return null;
+
+            if (rawDate instanceof Date && !isNaN(rawDate)) {
+                return rawDate;
+            }
+
+            const s = String(rawDate).trim();
+            if (!s) return null;
+
+            // Essai direct avec le constructeur Date
+            let d = new Date(s);
+            if (!isNaN(d)) return d;
+
+            // Format MySQL classique : "YYYY-MM-DD HH:MM:SS"
+            if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) {
+                d = new Date(s.replace(' ', 'T'));
+                if (!isNaN(d)) return d;
+            }
+
+            // Format "DD-MM-YYYY" ou "DD/MM/YYYY" (ex : 22-05-2025 venant d'Excel)
+            let m = s.match(/^(\d{2})[-/](\d{2})[-/](\d{4})$/);
+            if (m) {
+                const [_, dd, mm, yyyy] = m;
+                d = new Date(`${yyyy}-${mm}-${dd}T00:00:00`);
+                if (!isNaN(d)) return d;
+            }
+
+            // Format "YYYYMMDD"
+            m = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+            if (m) {
+                const [_, yyyy, mm, dd] = m;
+                d = new Date(`${yyyy}-${mm}-${dd}T00:00:00`);
+                if (!isNaN(d)) return d;
+            }
+
+            return null;
+        }
+
+        function parsePrixHT(rawPrix) {
+            if (rawPrix === null || rawPrix === undefined) return 0;
+            if (typeof rawPrix === 'number' && !isNaN(rawPrix)) return rawPrix;
+
+            const s = String(rawPrix).trim().replace(',', '.');
+            const n = parseFloat(s);
+            return isNaN(n) ? 0 : n;
+        }
+       let chartInstances = {}; // Pour stocker les instances de graphiques
         
         // AJOUT: Variables globales manquantes pour les doublons
         let duplicateData = [];
@@ -538,21 +587,44 @@
             // --- CORRECTION APPLIQUÉE ICI ---
             // ==================================================================
             ventes.forEach(data => {
-                // Conversion de la dateVente (colonne utilisée dans ton API)
-                // ET assignation au champ 'date' attendu par l'application
-const vente = {
-    ...data,
-    date: data.dateVente && !isNaN(new Date(data.dateVente))
-        ? new Date(data.dateVente)
-        : null
-};
+                // Récupérer la valeur de date renvoyée par l'API (plusieurs noms possibles)
+                const rawDate =
+                    data.dateVente ??
+                    data.date_vente ??
+                    data.date ??
+                    data.DateVente ??
+                    data.datevente ??
+                    data.GP_DATEPIECE ??
+                    data.gp_datepiece ??
+                    null;
 
-                // On ne garde que les ventes avec une date valide
-                if(vente.date) {
-                     allVentesData.push(vente);
-                } else {
-                     console.warn("Vente ignorée (date invalide ou manquante depuis l'API):", data);
+                // Parser la date de manière robuste (helper)
+                const parsedDate = parseVenteDate(rawDate);
+
+                // Forcer prixHT en nombre pour éviter les concaténations/NaN
+                const prixHT = parsePrixHT(
+                    data.prixHT ??
+                    data.prix_ht ??
+                    data.GL_PUHT ??
+                    data.gl_puht ??
+                    data.prix ??
+                    data.montant
+                );
+
+                const vente = {
+                    ...data,
+                    dateVente: rawDate,
+                    date: parsedDate,
+                    prixHT
+                };
+
+                if (!vente.date) {
+                    console.warn("Vente avec date invalide ou manquante (conservée):", data);
                 }
+
+                // On garde toujours la vente, même si la date est nulle ;
+                // les filtres/graphes sauront ignorer les dates manquantes.
+                allVentesData.push(vente);
             });
             // ==================================================================
             // --- FIN DE LA CORRECTION ---
@@ -1800,75 +1872,81 @@ const vente = {
             };
         }
 
-        function getFilteredData() {
-            // 1. Obtenir les filtres (via la nouvelle fonction)
-            const filters = getActiveFilters();
-            const { startDate, endDate } = getDateRangeFromPeriode(filters.periode);
+function getFilteredData() {
+    // 1. Obtenir les filtres
+    const filters = getActiveFilters();
+    const { startDate, endDate } = getDateRangeFromPeriode(filters.periode);
 
-            // 3. Filtrer les données
-            const filteredData = allVentesData.filter(vente => {
-                
-                // A. Filtre de Date (doit exister)
-                if (!vente.date) return false; // CORRIGÉ: S'assure que la date existe (grâce au 'null' de loadInitialData)
-                if (startDate && vente.date < startDate) return false;
-                if (endDate && vente.date > endDate) return false;
+    // 3. Filtrer les données
+    const filteredData = allVentesData.filter(vente => {
 
-                // B. Récupérer l'article (peut être undefined si inconnu)
-                const article = allArticlesData.get(vente.codeGold);
-                
-                // C. Déterminer le type de l'article
-                // Gère les anciennes données (isKnownArticle: undefined) en se basant sur la présence de l'article
-                const isKnown = (vente.isKnownArticle === undefined) ? (article != null) : (vente.isKnownArticle === true);
-                const articleMarque = article ? (article.marque ? article.marque.trim() : '') : '';
-
-                const is9plus1 = isKnown && articleMarque === '9+1';
-                const isAutre = isKnown && articleMarque !== '9+1';
-                const isUnknown = !isKnown;
-
-                // D. Appliquer les filtres
-                
-                // 1. Filtre TYPE (9+1 / Autres / Code Inconnu)
-                if (filters.types.length > 0) { // Si au moins un filtre de type est coché
-                    let matchesType = false;
-                    if (filters.types.includes('9+1') && is9plus1) matchesType = true;
-                    if (filters.types.includes('Autres') && isAutre) matchesType = true;
-                    if (filters.types.includes('Code Inconnu') && isUnknown) matchesType = true;
-                    
-                    if (!matchesType) return false; // Ne correspond à aucun type coché
-                }
-
-                // 2. Filtre MARQUE (ne s'applique que si le type est 'Autres')
-                if (isAutre) {
-                    // C'est un article "Autre", on applique le filtre Marque
-                    if (filters.marques.length > 0 && !filters.marques.includes(articleMarque)) return false;
-                } else {
-                    // C'est '9+1' ou 'Inconnu'. Si un filtre de marque est coché, on cache.
-                    if (filters.marques.length > 0) return false;
-                }
-                
-                // 3. Autres filtres (Animal, Poids, etc.)
-                // Ces filtres ne peuvent s'appliquer que si l'article est CONNU
-                if (isKnown && article) {
-                    if (filters.animals.length > 0 && !filters.animals.includes(article.animal)) return false;
-                    if (filters.poids.length > 0 && !filters.poids.includes(article.poids)) return false;
-                    // if (filters.articles.length > 0 && !filters.articles.includes(article.libelle)) return false; // SUPPRIMÉ
-                } else {
-                    // C'est 'Inconnu'. Si un de ces filtres est coché, on cache.
-                    if (filters.animals.length > 0 || filters.poids.length > 0 /*|| filters.articles.length > 0*/) return false; // Modifié
-                }
-                
-                // 4. Filtre Magasin (s'applique toujours)
-                if (filters.magasins.length > 0 && !filters.magasins.includes(vente.nomMagasin)) return false;
-
-                // 5. NOUVEAU: Filtre Code Gold (s'applique toujours)
-                if (filters.codeGolds.length > 0 && !filters.codeGolds.includes(vente.codeGold)) return false;
-
-                return true;
-            });
-            
-            console.log(`Filtrage terminé: ${filteredData.length} / ${allVentesData.length} lignes.`);
-            return filteredData;
+        // A. Filtre de Date
+        // -> Si la période est "Depuis toujours" (all), on accepte même sans date
+        if (!vente.date) {
+            if (filters.periode !== 'all') {
+                // Pour les autres périodes (aujourd'hui, ce mois, etc.), on exclut les ventes sans date
+                return false;
+            }
+        } else {
+            // Si on a une vraie date, on applique le filtre normal
+            if (startDate && vente.date < startDate) return false;
+            if (endDate && vente.date > endDate) return false;
         }
+
+        // B. Récupérer l'article (peut être undefined si inconnu)
+        const article = allArticlesData.get(vente.codeGold);
+
+        // C. Déterminer le type de l'article
+        const isKnown = (vente.isKnownArticle === undefined)
+            ? (article != null)
+            : (vente.isKnownArticle === true);
+
+        const articleMarque = article?.marque || '';
+        const is9plus1 = isKnown && articleMarque === '9+1';
+        const isAutre = isKnown && articleMarque !== '9+1';
+        const isUnknown = !isKnown;
+
+        // D. Appliquer les filtres TYPE (9+1 / Autres / Code Inconnu)
+        if (filters.types.length > 0) {
+            let matchesType = false;
+            if (filters.types.includes('9+1') && is9plus1) matchesType = true;
+            if (filters.types.includes('Autres') && isAutre) matchesType = true;
+            if (filters.types.includes('Code Inconnu') && isUnknown) matchesType = true;
+            if (!matchesType) return false;
+        }
+
+        // E. Filtre ANIMAL
+        if (filters.animals.length > 0) {
+            if (!article || !filters.animals.includes(article.animal)) return false;
+        }
+
+        // F. Filtre MARQUE (hors 9+1)
+        if (filters.marques.length > 0) {
+            if (!article || articleMarque === '9+1' || !filters.marques.includes(articleMarque)) return false;
+        }
+
+        // G. Filtre POIDS
+        if (filters.poids.length > 0) {
+            if (!article || !filters.poids.includes(article.poids)) return false;
+        }
+
+        // H. Filtre MAGASIN
+        if (filters.magasins.length > 0) {
+            if (!filters.magasins.includes(vente.nomMagasin)) return false;
+        }
+
+        // I. Filtre CODE GOLD
+        if (filters.codeGolds.length > 0) {
+            if (!filters.codeGolds.includes(vente.codeGold)) return false;
+        }
+
+        return true;
+    });
+
+    console.log(`Filtrage terminé: ${filteredData.length} / ${allVentesData.length} lignes.`);
+    return filteredData;
+}
+
         
         function getDateRangeFromPeriode(periode) {
             const now = new Date();
@@ -1973,17 +2051,41 @@ const vente = {
              // SUPPRIMÉ: unknownCount
 
              data.forEach(vente => {
-                 totalHTVA += vente.prixHT;
-                 magasins.add(vente.codeMagasin);
+                 const prix = Number(
+                     vente.prixHT ??
+                     vente.prix_ht ??
+                     vente.prix ??
+                     vente.montant ??
+                     0
+                 ) || 0;
+
+                 totalHTVA += prix;
+
+                 const magasinId = vente.nomMagasin || vente.codeMagasin || null;
+                 if (magasinId) {
+                     magasins.add(magasinId);
+                 }
                  nbArticles += 1;
-                 
-                 // SUPPRIMÉ: Compteur des codes inconnus
              });
 
-             document.getElementById('kpi-total').textContent = `€${totalHTVA.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-             document.getElementById('kpi-nb-magasins').textContent = magasins.size.toLocaleString('fr-FR');
-             document.getElementById('kpi-nb-articles').textContent = nbArticles.toLocaleString('fr-FR');
-             
+             const totalEl = document.getElementById('kpi-total');
+             if (totalEl) {
+                 totalEl.textContent = `€${totalHTVA.toLocaleString('fr-FR', {
+                     minimumFractionDigits: 2,
+                     maximumFractionDigits: 2
+                 })}`;
+             }
+
+             const magasinsEl = document.getElementById('kpi-nb-magasins');
+             if (magasinsEl) {
+                 magasinsEl.textContent = magasins.size.toLocaleString('fr-FR');
+             }
+
+             const articlesEl = document.getElementById('kpi-nb-articles');
+             if (articlesEl) {
+                 articlesEl.textContent = nbArticles.toLocaleString('fr-FR');
+             }
+
              // SUPPRIMÉ: Mise à jour du KPI des inconnus
         }
 
@@ -2285,7 +2387,7 @@ const vente = {
             if (!tableBody) return;
 
             // Sort by date, most recent first
-                const sortedVentes = [...allVentesData].sort((a, b) => {
+            const sortedVentes = [...allVentesData].sort((a, b) => {
                 const dateA = a.date || 0;
                 const dateB = b.date || 0;
                 return dateB - dateA;
